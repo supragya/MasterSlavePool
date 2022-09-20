@@ -2,6 +2,7 @@ package masterslavepool
 
 import (
 	"errors"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -11,6 +12,7 @@ import (
 )
 
 type PoolNodeMeta struct {
+	Identity    string
 	IsAlive     bool
 	Reports     uint32
 	reportMutex sync.Mutex
@@ -24,9 +26,23 @@ type PoolNode[I any] struct {
 	Meta PoolNodeMeta
 }
 
+type MSPoolConfig struct {
+	WindowSize     uint32
+	ToleranceCount uint32
+	TimeStep       time.Duration
+	RetryTimesteps uint32
+}
+
+var DefaultMSPoolConfig MSPoolConfig = MSPoolConfig{
+	WindowSize:     20,
+	ToleranceCount: 8,
+	TimeStep:       time.Millisecond * 10,
+	RetryTimesteps: 100,
+}
+
 type MasterSlavePool[I any] struct {
+	config               MSPoolConfig
 	rwlock               sync.RWMutex
-	timeStep             time.Duration
 	allFailureLogTime    time.Time
 	allFailureCachedItem *I
 	itemMap              map[*I]*PoolNode[*I]
@@ -45,10 +61,11 @@ func (a DurationTupleList[I]) Len() int           { return len(a) }
 func (a DurationTupleList[I]) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a DurationTupleList[I]) Less(i, j int) bool { return a[i].Duration < a[j].Duration }
 
-func NewNode[I any](item *I) PoolNode[*I] {
+func NewNode[I any](item *I, identity string) PoolNode[*I] {
 	return PoolNode[*I]{
 		Item: item,
 		Meta: PoolNodeMeta{
+			Identity:    identity,
 			IsAlive:     true,
 			Reports:     0,
 			reportMutex: sync.Mutex{},
@@ -60,7 +77,8 @@ func NewNode[I any](item *I) PoolNode[*I] {
 }
 
 func NewEthClientMasterSlavePool(masterURL string,
-	slaveURLs []string) (*MasterSlavePool[ethclient.Client], error) {
+	slaveURLs []string,
+	config MSPoolConfig) (*MasterSlavePool[ethclient.Client], error) {
 	itemMap := make(map[*ethclient.Client]*PoolNode[*ethclient.Client], len(slaveURLs)+1)
 
 	// Setup master
@@ -68,24 +86,24 @@ func NewEthClientMasterSlavePool(masterURL string,
 	if err != nil {
 		return nil, err
 	}
-	master := NewNode(ms)
+	master := NewNode(ms, "master")
 	itemMap[ms] = &master
 
 	// Setup slaves
 	slaves := []*PoolNode[*ethclient.Client]{}
-	for _, url := range slaveURLs {
+	for idx, url := range slaveURLs {
 		cl, err := ethclient.Dial(url)
 		if err != nil {
 			return nil, err
 		}
-		slave := NewNode(cl)
+		slave := NewNode(cl, fmt.Sprintf("slave%v", idx))
 		itemMap[cl] = &slave
 		slaves = append(slaves, &slave)
 	}
 
 	return &MasterSlavePool[ethclient.Client]{
+		config:               config,
 		rwlock:               sync.RWMutex{},
-		timeStep:             time.Duration(100 * time.Millisecond),
 		allFailureLogTime:    time.Time{},
 		allFailureCachedItem: nil,
 		itemMap:              itemMap,
@@ -98,7 +116,7 @@ func (m *MasterSlavePool[I]) Report(item *I, timedOut bool) error {
 	if !timedOut {
 		return nil
 	}
-	pool, ok := m.itemMap[item]
+	pn, ok := m.itemMap[item]
 	if !ok {
 		return errors.New("item not found")
 	}
@@ -106,35 +124,36 @@ func (m *MasterSlavePool[I]) Report(item *I, timedOut bool) error {
 	now := time.Now()
 
 	// Short circuit in case of pool being not alive or last report too recently
-	if !pool.Meta.IsAlive || now.Sub(pool.Meta.LastReport) < m.timeStep {
+	if !pn.Meta.IsAlive || now.Sub(pn.Meta.LastReport) < m.config.TimeStep {
 		return nil
 	}
 
-	pool.Meta.reportMutex.Lock()
-	defer pool.Meta.reportMutex.Unlock()
+	pn.Meta.reportMutex.Lock()
+	defer pn.Meta.reportMutex.Unlock()
 
 	now = time.Now()
 	// Maybe somebody else reported while we were waiting for lock
 	// Short circuit in case of pool being not alive or last report too recently
-	if !pool.Meta.IsAlive || now.Sub(pool.Meta.LastReport) < m.timeStep {
+	if !pn.Meta.IsAlive || now.Sub(pn.Meta.LastReport) < m.config.TimeStep {
 		return nil
 	}
 
-	pool.Meta.LastReport = now
+	pn.Meta.LastReport = now
 
 	// We forget all the failures accrued till now if counter addition
 	// start time has been since long.
-	if now.Sub(pool.Meta.FirstReport) > m.timeStep*20 {
-		pool.Meta.FirstReport = now
-		pool.Meta.Reports = 1
+	if now.Sub(pn.Meta.FirstReport) > m.config.TimeStep*time.Duration(m.config.WindowSize) {
+		pn.Meta.FirstReport = now
+		pn.Meta.Reports = 1
 	} else {
-		pool.Meta.Reports += 1
+		pn.Meta.Reports += 1
 	}
 
 	// If more than enough (40%) of timeSteps have resulted in failure, go to cooldown
-	if pool.Meta.Reports > 8 && now.Sub(pool.Meta.FirstReport) < m.timeStep*20 {
-		pool.Meta.IsAlive = false
-		pool.Meta.BringAlive = now.Add(m.timeStep * 10)
+	if pn.Meta.Reports > m.config.ToleranceCount && now.Sub(pn.Meta.FirstReport) < m.config.TimeStep*time.Duration(m.config.WindowSize) {
+		log.Warn("mspool reports upstream failure for: ", pn.Meta.Identity)
+		pn.Meta.IsAlive = false
+		pn.Meta.BringAlive = now.Add(m.config.TimeStep * time.Duration(m.config.RetryTimesteps))
 	}
 
 	return nil
@@ -153,7 +172,7 @@ func (m *MasterSlavePool[I]) GetItem() *I {
 	// If master is not alive, check if time has come to
 	// recheck on master
 	now := time.Now()
-	if m.Master.Meta.BringAlive.Sub(now) == time.Duration(0) {
+	if m.Master.Meta.BringAlive.Sub(now) <= time.Duration(0) {
 		m.rwlock.RUnlock()
 		m.rwlock.Lock()
 		MakeAlive(&m.Master.Meta)
@@ -169,7 +188,7 @@ func (m *MasterSlavePool[I]) GetItem() *I {
 			m.rwlock.RUnlock()
 			return slave.Item
 		}
-		if sm.BringAlive.Sub(now) == time.Duration(0) {
+		if sm.BringAlive.Sub(now) <= time.Duration(0) {
 			m.rwlock.RUnlock()
 			m.rwlock.Lock()
 			MakeAlive(&slave.Meta)
@@ -197,7 +216,7 @@ func (m *MasterSlavePool[I]) allFailureRecovery() *I {
 	// sort and wait, sets for a timeStep a cached item. Rest of
 	// the threads pick this item and return
 
-	if m.allFailureLogTime.Sub(currentTime) == time.Duration(0) {
+	if m.allFailureLogTime.Sub(currentTime) <= time.Duration(0) {
 		// First thread doing hefty work
 		log.Warn("critical rpc failure. all upstreams in cooldown state. blocking application")
 	} else {
@@ -232,7 +251,7 @@ func (m *MasterSlavePool[I]) allFailureRecovery() *I {
 		}
 	}
 
-	m.allFailureLogTime = currentTime.Add(time.Duration(m.timeStep))
+	m.allFailureLogTime = currentTime.Add(m.config.TimeStep)
 	m.allFailureCachedItem = list[0].Item.Item
 
 	return m.allFailureCachedItem
