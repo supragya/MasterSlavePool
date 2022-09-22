@@ -151,7 +151,7 @@ func (m *MasterSlavePool[I]) Report(item *I, timedOut bool) error {
 
 	// If more than enough (40%) of timeSteps have resulted in failure, go to cooldown
 	if pn.Meta.Reports > m.config.ToleranceCount && now.Sub(pn.Meta.FirstReport) < m.config.TimeStep*time.Duration(m.config.WindowSize) {
-		log.Warn("mspool reports upstream failure for: ", pn.Meta.Identity)
+		fmt.Println("mspool reports upstream failure for: ", pn.Meta.Identity)
 		pn.Meta.IsAlive = false
 		pn.Meta.BringAlive = now.Add(m.config.TimeStep * time.Duration(m.config.RetryTimesteps))
 	}
